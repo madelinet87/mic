@@ -1,18 +1,16 @@
 import React, { useState, useRef, useEffect } from 'react';
 
 interface RecordButtonProps {
-  postUrl: string;
   filenamePrefix?: string;
   onAudioReady: (blob: Blob, file: File) => void;
   onError: (error: Error) => void;
-  onStateChange: (state: 'idle' | 'recording' | 'finalizing' | 'error') => void;
+  onStateChange: (state: 'idle' | 'recording' | 'finalizing' | 'completed' | 'error') => void;
   useVad?: boolean;
   vadSilenceSeconds?: number;
   mimeTypeOverride?: string;
 }
 
 export const RecordButton: React.FC<RecordButtonProps> = ({
-  postUrl,
   filenamePrefix = 'recording',
   onAudioReady,
   onError,
@@ -21,28 +19,52 @@ export const RecordButton: React.FC<RecordButtonProps> = ({
   vadSilenceSeconds = 3,
   mimeTypeOverride,
 }) => {
-  const [state, setState] = useState<'idle' | 'recording' | 'finalizing' | 'error'>('idle');
+  // Debug flag for logging
+  const DEBUG = true;
+  // Check for browser support
+  const isSupported = typeof window !== 'undefined' && window.MediaRecorder && navigator.mediaDevices;
+  const [state, setState] = useState<'idle' | 'recording' | 'finalizing' | 'completed' | 'error'>('idle');
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
-  const vadTimeoutRef = useRef<number | null>(null);
+  const vadIntervalRef = useRef<number | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      streamRef.current?.getTracks().forEach(track => track.stop());
-      if (vadTimeoutRef.current) window.clearTimeout(vadTimeoutRef.current);
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => {
+          if (track.readyState === 'live') track.stop();
+        });
+        streamRef.current = null;
+      }
+      if (vadIntervalRef.current) {
+        window.clearInterval(vadIntervalRef.current);
+        vadIntervalRef.current = null;
+      }
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+        audioContextRef.current = null;
+      }
     };
   }, []);
 
   const startRecording = async () => {
+    if (!isSupported) {
+      alert('Your browser does not support audio recording.');
+      setState('error');
+      onStateChange('error');
+      onError(new Error('MediaRecorder or mediaDevices not supported'));
+      return;
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
       let mimeType = mimeTypeOverride || '';
       if (mimeType && !MediaRecorder.isTypeSupported(mimeType)) {
-        console.warn(`MIME type ${mimeType} not supported, falling back`);
+        if (DEBUG) console.warn(`[RecordButton] MIME type ${mimeType} not supported, falling back`);
         mimeType = '';
       }
       if (!mimeType) {
@@ -60,96 +82,163 @@ export const RecordButton: React.FC<RecordButtonProps> = ({
       };
 
       mediaRecorder.onstop = async () => {
-         setState('finalizing');
-         onStateChange('finalizing');
+        if (DEBUG) console.log('[RecordButton] MediaRecorder onstop called');
+        setState('finalizing');
+        onStateChange('finalizing');
 
-         const blob = new Blob(audioChunksRef.current, { type: mimeType });
-         const file = new File([blob], `${filenamePrefix}-${Date.now()}.webm`, { type: mimeType });
+        const blob = new Blob(audioChunksRef.current, { type: mimeType });
+        const file = new File([blob], `${filenamePrefix}-${Date.now()}.webm`, { type: mimeType });
+        audioChunksRef.current = []; // cleanup
+        onAudioReady(blob, file);
+        if (streamRef.current) {
+          if (DEBUG) console.log('[RecordButton] Aggressively stopping all stream tracks');
+          streamRef.current.getTracks().forEach(track => {
+            if (track.readyState === 'live') track.stop();
+          });
+          streamRef.current = null;
+        } else {
+          if (DEBUG) console.log('[RecordButton] No streamRef to stop');
+        }
 
-         audioChunksRef.current = []; // cleanup
-
-         onAudioReady(blob, file);
-
-         stream.getTracks().forEach(track => track.stop());
-
-         try {
-           const formData = new FormData();
-           formData.append('file', file);
-           await fetch(postUrl, { method: 'POST', body: formData });
-
-           console.log('[RecordButton] Setting idle (after upload)');
-           setState('idle');
-           onStateChange('idle');
-         } catch (err) {
-           onError(err as Error);
-           setState('error');
-           onStateChange('error');
-         }
+        setState('completed');
+        onStateChange('completed');
       };
 
-      mediaRecorder.start();
-      setState('recording');
-      onStateChange('recording');
+      try {
+        mediaRecorder.start();
+        if (DEBUG) console.log('[RecordButton] Started recording');
+        setState('recording');
+        onStateChange('recording');
+      } catch (err) {
+        if (DEBUG) console.error('[RecordButton] Error starting recording:', err);
+        streamRef.current?.getTracks().forEach(track => track.stop());
+        setState('idle');
+        onStateChange('idle');
+        // User-friendly error message
+        let message = 'Microphone access denied. Please allow access and try again.';
+        if (err instanceof Error && err.message) {
+          message += `\nDetails: ${err.message}`;
+        }
+        alert(message);
+        onError(err as Error);
+      }
 
       // Voice Activity Detection (optional)
       if (useVad) {
-        const audioContext = new AudioContext();
-        const source = audioContext.createMediaStreamSource(stream);
-        const analyser = audioContext.createAnalyser();
-        source.connect(analyser);
-        analyser.fftSize = 512;
+        let audioContext: AudioContext;
+        let source: MediaStreamAudioSourceNode;
+        let analyser: AnalyserNode;
+        try {
+          audioContext = new AudioContext();
+          audioContextRef.current = audioContext;
+          source = audioContext.createMediaStreamSource(stream);
+          analyser = audioContext.createAnalyser();
+          source.connect(analyser);
+          analyser.fftSize = 512;
+          analyser.smoothingTimeConstant = 0.8;
+        } catch (err) {
+          if (DEBUG) console.error('[RecordButton] Error initializing audio context for VAD:', err);
+          alert('Error initializing audio context for VAD.');
+          setState('error');
+          onStateChange('error');
+          onError(err as Error);
+          return;
+        }
         const bufferLength = analyser.fftSize;
         const dataArray = new Uint8Array(bufferLength);
+        let silentFrames = 0;
+        let minRecordingMs = 1500;
+        let recordingStart = Date.now();
+        const silenceThreshold = 0.025;
+        const speechThreshold = 0.04;
+        const requiredSilenceFrames = Math.round((vadSilenceSeconds * 1000) / (1000 / 45)); // ~45fps
 
-        const checkSilence = () => {
-          analyser.getByteTimeDomainData(dataArray);
-          const rms =
-            Math.sqrt(dataArray.reduce((acc, val) => acc + (val - 128) ** 2, 0) / bufferLength) /
-            128;
-
-          if (rms < 0.02) {
-            if (!vadTimeoutRef.current) {
-              vadTimeoutRef.current = window.setTimeout(() => {
-                stopRecording();
-              }, vadSilenceSeconds * 1000);
+        vadIntervalRef.current = window.setInterval(() => {
+          try {
+            analyser.getByteTimeDomainData(dataArray);
+            // Exponential moving average for RMS
+            let rms = 0;
+            for (let i = 0; i < bufferLength; i++) {
+              rms += (dataArray[i] - 128) * (dataArray[i] - 128);
             }
-          } else {
-            if (vadTimeoutRef.current) {
-              window.clearTimeout(vadTimeoutRef.current);
-              vadTimeoutRef.current = null;
+            rms = Math.sqrt(rms / bufferLength) / 128;
+
+            // Hysteresis: only count as silent if below silenceThreshold, reset if above speechThreshold
+            if (rms < silenceThreshold) {
+              silentFrames++;
+            } else if (rms > speechThreshold) {
+              silentFrames = 0;
             }
-          }
 
-          if (state === 'recording') {
-            requestAnimationFrame(checkSilence);
+            // Only stop if enough silent frames AND minimum recording duration met
+            if (
+              silentFrames > requiredSilenceFrames &&
+              Date.now() - recordingStart > minRecordingMs
+            ) {
+              stopRecording();
+            }
+          } catch (err) {
+            if (DEBUG) console.error('[RecordButton] Error during VAD analysis:', err);
+            alert('Error during VAD analysis.');
+            setState('error');
+            onStateChange('error');
+            onError(err as Error);
           }
-        };
-
-        requestAnimationFrame(checkSilence);
+        }, 1000 / 45);
       }
     } catch (err) {
+      streamRef.current?.getTracks().forEach(track => track.stop());
+      setState('idle');
+      onStateChange('idle');
       onError(err as Error);
-      setState('error');
-      onStateChange('error');
     }
   };
 
   const stopRecording = () => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
+    try {
+      if (DEBUG) console.log('[RecordButton] stopRecording called');
+      // Stop VAD interval if running
+      if (vadIntervalRef.current) {
+        window.clearInterval(vadIntervalRef.current);
+        vadIntervalRef.current = null;
+        if (DEBUG) console.log('[RecordButton] VAD interval cleared');
+      }
+      // Close audio context if used
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+        audioContextRef.current = null;
+        if (DEBUG) console.log('[RecordButton] AudioContext closed');
+      }
+      // Stop media recorder
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        if (DEBUG) console.log('[RecordButton] Stopping MediaRecorder');
+        mediaRecorderRef.current.stop();
+      } else {
+        if (DEBUG) console.log('[RecordButton] MediaRecorder already inactive');
+      }
+      // Do NOT stop stream here; let mediaRecorder.onstop handle it for proper cleanup
+    } catch (err) {
+      if (DEBUG) console.error('[RecordButton] Error stopping recording:', err);
+      setState('idle');
+      onStateChange('idle');
+      alert('Error stopping recording. Please try again.');
+      onError(err as Error);
     }
   };
 
   return (
     <button
       onClick={() => {
-        if (state === 'idle') {
+        if (state === 'idle' || state === 'completed') {
+          setState('idle');
+          onStateChange('idle');
           startRecording();
         } else if (state === 'recording') {
           stopRecording();
         }
       }}
-      disabled={state === 'finalizing'}
+      disabled={state === 'finalizing' || state === 'error'}
+      aria-live="assertive"
       style={{
         padding: '10px 20px',
         fontSize: '1rem',
@@ -160,17 +249,18 @@ export const RecordButton: React.FC<RecordButtonProps> = ({
             ? '#e74c3c'
             : state === 'finalizing'
             ? '#f39c12'
+            : state === 'error'
+            ? '#bdc3c7'
             : '#2ecc71',
         color: '#fff',
-        cursor: state === 'finalizing' ? 'not-allowed' : 'pointer',
+        cursor: state === 'finalizing' || state === 'error' ? 'not-allowed' : 'pointer',
         transition: 'background 0.2s',
       }}
     >
-      {state === 'recording'
-        ? 'Stop Recording'
-        : state === 'finalizing'
-        ? 'Finalizing...'
-        : 'Start Recording'}
+      {state === 'recording' && 'Stop Recording'}
+      {state === 'finalizing' && 'Finalizing...'}
+      {state === 'error' && 'Error'}
+      {(state === 'idle' || state === 'completed') && 'Start Recording'}
     </button>
-  );
-};
+    );
+  };
